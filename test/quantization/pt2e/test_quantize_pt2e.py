@@ -20,6 +20,7 @@ from torch.ao.quantization._pt2e.quantizer import (
 )
 from torch.ao.quantization._quantize_pt2e import (
     convert_pt2e,
+    _convert_to_reference_decomposed_fx,
     prepare_pt2e_quantizer,
     prepare_qat_pt2e_quantizer,
 )
@@ -28,11 +29,12 @@ from torch.ao.quantization.backend_config import get_qnnpack_backend_config
 from torch.ao.quantization.qconfig import (
     default_per_channel_symmetric_qnnpack_qat_qconfig,
     default_per_channel_symmetric_qnnpack_qconfig,
+    default_symmetric_qnnpack_qat_qconfig,
 )
 from torch.ao.quantization.quantize_fx import (
-    convert_to_reference_fx,
     prepare_fx,
     prepare_qat_fx,
+    convert_to_reference_fx,
 )
 from torch.testing._internal.common_quantization import (
     NodeSpec as ns,
@@ -360,6 +362,54 @@ class TestQuantizePT2E(QuantizationTestCase):
         # Verify that numerics match
         self.assertEqual(result, result_fx)
 
+    def test_convert_qat_conv_bn_fusion(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = torch.nn.Conv2d(3, 3, 3)
+                self.bn = torch.nn.BatchNorm2d(3)
+
+            def forward(self, x):
+                x = self.conv(x)
+                x = self.bn(x)
+                return x
+
+        import torch.ao.quantization._pt2e.quantizer.qnnpack_quantizer as qq
+        quantizer = QNNPackQuantizer()
+        quantizer.set_global(qq.get_symmetric_quantization_config(is_per_channel=False, is_qat=True))
+        m = M()
+        m_copy = copy.deepcopy(m)
+        example_inputs = (torch.randn(1, 3, 5, 5),)
+
+        # program capture
+        m, guards = torchdynamo.export(
+            m,
+            *copy.deepcopy(example_inputs),
+            aten_graph=True,
+        )
+
+        m = prepare_qat_pt2e_quantizer(m, quantizer)
+        after_prepare_result_pt2e = m(*example_inputs)
+        m = convert_pt2e(m)
+        after_quant_result_pt2e = m(*example_inputs)
+
+        # comparing with existing fx graph mode quantization reference flow
+        qconfig = default_symmetric_qnnpack_qat_qconfig
+        # qconfig = default_per_channel_symmetric_qnnpack_qat_qconfig
+        qconfig_mapping = QConfigMapping().set_global(qconfig)
+        backend_config = get_qnnpack_backend_config()
+        # run this once first to match the result of export
+        # Note: this is a bug for export symbolic tracing, we can remove this line
+        # after it's fixed:
+        m_copy(*example_inputs)
+        m_fx = prepare_qat_fx(
+            m_copy, qconfig_mapping, example_inputs, backend_config=backend_config
+        )
+        after_prepare_result_fx = m_fx(*example_inputs)
+        m_fx = _convert_to_reference_decomposed_fx(m_fx, backend_config=backend_config)
+        after_quant_result_fx = m_fx(*example_inputs)
+
+        self.assertEqual(after_quant_result_pt2e, after_quant_result_fx)
 
 class TestQuantizePT2EModels(QuantizationTestCase):
     @skip_if_no_torchvision
